@@ -1,0 +1,22 @@
+{
+  "generated_at": "2026-09-15T00:51:19+00:00",
+  "universe_size": 857,
+  "priced_ok": 0,
+  "technical_pass": 0,
+  "winners_count": 0,
+  "criteria": {
+    "technical": "Preco > MM50 > MM150 > MM200",
+    "ma200_rising": true,
+    "min_pct_above_52w_low": 0.3,
+    "max_pct_below_52w_high": 0.25,
+    "min_roic": 0.15,
+    "roiic_gt_roic": true,
+    "excluded_sectors": [
+      "Financial Services",
+      "Real Estate",
+      "Utilities"
+    ]
+  },
+  "elapsed_seconds": 93.4,
+  "winners": []
+}
