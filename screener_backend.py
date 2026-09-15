@@ -52,7 +52,10 @@ FAILURE_TTL_HOURS = 6               # falha NAO e cacheada por 15 dias: pode ser
                                     # bloqueio temporario do Yahoo, nao ausencia de dado
 
 PRICE_PERIOD = "2y"
-BATCH_SIZE = 200                    # tickers por chamada de yf.download
+BATCH_SIZE = 100                    # tickers por chamada de yf.download
+REPAIR_PRICES = False               # repair=True tem bugs conhecidos que levantam
+                                    # excecao e derrubam o lote inteiro. Manter OFF.
+MIN_BATCH_RETRY = 20                # lote que falha e dividido ao meio ate este piso
 PAUSE_BETWEEN_BATCHES = 1.5         # segundos (evita 429 / IP ban)
 PRICE_THREADS = 8                   # threads internas do yfinance por lote
 
@@ -88,6 +91,7 @@ log = logging.getLogger("screener")
 # Contador de motivos de descarte. Sem isso, um resultado vazio e indistinguivel
 # de um bug: o log final mostra exatamente onde o funil estrangulou.
 REJECTIONS: Counter = Counter()
+DOWNLOAD_ERRORS: Counter = Counter()
 _LOCK = threading.Lock()
 
 
@@ -358,54 +362,110 @@ def chunk(seq: list[str], size: int):
         yield seq[i:i + size]
 
 
+def _extract_ticker(raw: pd.DataFrame, tkr: str) -> pd.DataFrame | None:
+    """
+    Isola as colunas de um ticker. O yfinance ja mudou a ordem dos niveis
+    entre versoes, entao tentamos os dois em vez de assumir um formato.
+    """
+    if raw is None or raw.empty:
+        return None
+    if not isinstance(raw.columns, pd.MultiIndex):
+        return raw.copy()
+    try:
+        if tkr in set(raw.columns.get_level_values(0)):
+            return raw.xs(tkr, axis=1, level=0).copy()
+        if tkr in set(raw.columns.get_level_values(1)):
+            return raw.xs(tkr, axis=1, level=1).copy()
+    except Exception:
+        return None
+    return None
+
+
+def _download_call(batch: list[str]) -> pd.DataFrame | None:
+    return yf.download(
+        tickers=batch,
+        period=PRICE_PERIOD,
+        interval="1d",
+        group_by="ticker",
+        auto_adjust=True,
+        threads=PRICE_THREADS,
+        progress=False,
+        repair=REPAIR_PRICES,
+    )
+
+
+def _collect(raw: pd.DataFrame | None, batch: list[str],
+             frames: dict[str, pd.DataFrame]) -> int:
+    """Extrai cada ticker do bloco. Um ticker quebrado nao derruba os demais."""
+    got = 0
+    for tkr in batch:
+        try:
+            df = _extract_ticker(raw, tkr)
+            if df is None:
+                continue
+            if "Close" not in df.columns:
+                continue
+            df = df.dropna(subset=["Close"])
+            if df.empty or len(df) < MIN_HISTORY_BARS:
+                continue
+            frames[tkr] = df
+            got += 1
+        except Exception:
+            continue
+    return got
+
+
+def _download_recursive(batch: list[str], frames: dict[str, pd.DataFrame],
+                        depth: int = 0) -> None:
+    """
+    Se a chamada estourar, divide o lote ao meio e tenta de novo, em vez de
+    descartar todos os tickers por causa de um unico problematico.
+    """
+    if not batch:
+        return
+    try:
+        raw = _download_call(batch)
+    except Exception as exc:
+        msg = f"{type(exc).__name__}: {str(exc)[:120]}"
+        DOWNLOAD_ERRORS[msg] += 1
+        log.warning("Lote de %d falhou (%s)", len(batch), msg)
+        if len(batch) <= MIN_BATCH_RETRY or depth >= 4:
+            DOWNLOAD_ERRORS[f"desistiu de {len(batch)} tickers"] += 1
+            return
+        meio = len(batch) // 2
+        time.sleep(PAUSE_BETWEEN_BATCHES)
+        _download_recursive(batch[:meio], frames, depth + 1)
+        time.sleep(PAUSE_BETWEEN_BATCHES)
+        _download_recursive(batch[meio:], frames, depth + 1)
+        return
+
+    if raw is None or raw.empty:
+        DOWNLOAD_ERRORS["resposta vazia do Yahoo"] += 1
+        log.warning("Lote de %d voltou vazio", len(batch))
+        return
+
+    got = _collect(raw, batch, frames)
+    if got == 0:
+        DOWNLOAD_ERRORS["lote sem nenhum ticker aproveitavel"] += 1
+
+
 def download_prices(tickers: list[str]) -> dict[str, pd.DataFrame]:
     """Baixa historico diario em lotes. Retorna {ticker: DataFrame limpo}."""
     frames: dict[str, pd.DataFrame] = {}
     batches = list(chunk(tickers, BATCH_SIZE))
 
     for i, batch in enumerate(batches, 1):
-        log.info("Precos: lote %d/%d (%d tickers)", i, len(batches), len(batch))
-        try:
-            raw = yf.download(
-                tickers=batch,
-                period=PRICE_PERIOD,
-                interval="1d",
-                group_by="ticker",
-                auto_adjust=True,
-                actions=False,
-                threads=PRICE_THREADS,
-                progress=False,
-                repair=True,
-            )
-        except Exception as exc:
-            log.warning("Lote %d falhou por completo: %s", i, exc)
-            time.sleep(PAUSE_BETWEEN_BATCHES * 3)
-            continue
-
-        if raw is None or raw.empty:
-            log.warning("Lote %d voltou vazio", i)
-            time.sleep(PAUSE_BETWEEN_BATCHES)
-            continue
-
-        for tkr in batch:
-            try:
-                if isinstance(raw.columns, pd.MultiIndex):
-                    if tkr not in raw.columns.get_level_values(0):
-                        continue
-                    df = raw[tkr].copy()
-                else:                                  # lote de 1 ticker
-                    df = raw.copy()
-
-                df = df.dropna(subset=["Close"])
-                if df.empty or len(df) < MIN_HISTORY_BARS:
-                    continue
-                frames[tkr] = df
-            except Exception:
-                continue
-
+        antes = len(frames)
+        _download_recursive(batch, frames)
+        log.info("Precos: lote %d/%d — %d de %d tickers OK (total %d)",
+                 i, len(batches), len(frames) - antes, len(batch), len(frames))
         time.sleep(PAUSE_BETWEEN_BATCHES)
 
     log.info("Precos validos: %d de %d", len(frames), len(tickers))
+    if DOWNLOAD_ERRORS:
+        log.warning("---- Problemas no download ----")
+        for msg, count in DOWNLOAD_ERRORS.most_common(8):
+            log.warning("  %-60s %4d", msg[:60], count)
     return frames
 
 
@@ -822,6 +882,7 @@ def run(markets: list[str], expand: bool, use_cache: bool) -> dict:
         },
         "elapsed_seconds": round(time.time() - t0, 1),
         "rejections": dict(reject_report()),
+        "download_errors": dict(DOWNLOAD_ERRORS.most_common(10)),
         "winners": clean,
     }
 
