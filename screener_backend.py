@@ -30,6 +30,9 @@ import os
 import random
 import sys
 import time
+import urllib.error
+import urllib.request
+from io import StringIO
 import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -274,6 +277,17 @@ INDEX_SOURCES: list[tuple[str, str, str, str]] = [
     ("HK", "https://en.wikipedia.org/wiki/Hang_Seng_Index", "Ticker", ".HK"),
 ]
 
+# A Wikipedia recusa requisicoes que nao se identificam como navegador
+# (devolve 403). Sem este cabecalho, a expansao falha em silencio e o
+# universo encolhe para as listas curadas sem ninguem perceber.
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+
+# Quantos tickers cada fonte rendeu nesta execucao (vai para o JSON final).
+UNIVERSE_SOURCES: dict[str, int] = {}
+
 TICKER_COLUMN_CANDIDATES = ["Symbol", "Ticker", "Ticker symbol", "Code", "Epic"]
 
 
@@ -302,12 +316,37 @@ def _normalize(sym: Any, suffix: str) -> str | None:
     return f"{s}{suffix}"
 
 
-def fetch_index_members(url: str, column: str, suffix: str) -> list[str]:
-    """Le tabelas da Wikipedia e extrai constituintes. Falha silenciosa."""
+def _fetch_html(url: str) -> str | None:
+    """Baixa a pagina fingindo ser um navegador. None se nao conseguir."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": BROWSER_UA,
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    )
     try:
-        tables = pd.read_html(url, flavor="lxml")
-    except Exception as exc:                       # rede, layout, parser...
-        log.debug("Falha ao ler %s: %s", url, exc)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        log.warning("  !! %s devolveu HTTP %s", url.split("/")[-1][:45], exc.code)
+    except Exception as exc:
+        log.warning("  !! %s falhou: %s", url.split("/")[-1][:45], type(exc).__name__)
+    return None
+
+
+def fetch_index_members(url: str, column: str, suffix: str) -> list[str]:
+    """Le a tabela de constituintes de um indice. Falha e sempre reportada."""
+    html = _fetch_html(url)
+    if html is None:
+        return []
+
+    try:
+        tables = pd.read_html(StringIO(html), flavor="lxml")
+    except Exception as exc:
+        log.warning("  !! %s: tabela ilegivel (%s)",
+                    url.split("/")[-1][:45], type(exc).__name__)
         return []
 
     candidates = [column] + [c for c in TICKER_COLUMN_CANDIDATES if c != column]
@@ -323,6 +362,10 @@ def fetch_index_members(url: str, column: str, suffix: str) -> list[str]:
                 out.append(norm)
         if out:
             break
+
+    if not out:
+        log.warning("  !! %s: nenhuma coluna de ticker reconhecida",
+                    url.split("/")[-1][:45])
     return out
 
 
@@ -333,13 +376,27 @@ def build_universe(markets: list[str], expand: bool) -> list[str]:
     log.info("Listas curadas: %d tickers", len(tickers))
 
     if expand:
+        log.info("Expandindo universo pelos constituintes de indice...")
+        total_expandido = 0
         for market, url, col, suffix in INDEX_SOURCES:
             if market not in markets:
                 continue
+            nome = url.split("/")[-1][:45]
             members = fetch_index_members(url, col, suffix)
-            log.info("  + %-4s %-60s %d", market, url.split("/")[-1][:60], len(members))
+            UNIVERSE_SOURCES[f"{market}:{nome}"] = len(members)
+            total_expandido += len(members)
+            log.info("  + %-4s %-46s %5d", market, nome, len(members))
             tickers.extend(members)
             time.sleep(0.5)
+
+        if total_expandido == 0:
+            log.error("ATENCAO: a expansao nao trouxe NENHUM ticker.")
+            log.error("O universo ficou limitado as listas curadas.")
+        else:
+            log.info("Expansao trouxe %d tickers (antes de remover repetidos).",
+                     total_expandido)
+    else:
+        log.info("Modo rapido: expansao de indices DESLIGADA.")
 
     # Arquivo opcional do usuario: um ticker por linha, ja com sufixo.
     if os.path.exists("custom_tickers.txt"):
@@ -868,6 +925,8 @@ def run(markets: list[str], expand: bool, use_cache: bool) -> dict:
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "universe_size": len(universe),
+        "universe_sources": dict(UNIVERSE_SOURCES),
+        "expansion_enabled": expand,
         "priced_ok": len(prices),
         "technical_pass": len(survivors),
         "winners_count": len(clean),
