@@ -30,6 +30,8 @@ import os
 import random
 import sys
 import time
+import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
@@ -46,6 +48,8 @@ OUTPUT_FILE = "winners_data.json"
 CACHE_DIR = "cache"
 FUNDAMENTALS_CACHE = os.path.join(CACHE_DIR, "fundamentals")
 FUNDAMENTALS_TTL_DAYS = 15          # balanco nao muda todo dia; cache agressivo
+FAILURE_TTL_HOURS = 6               # falha NAO e cacheada por 15 dias: pode ser
+                                    # bloqueio temporario do Yahoo, nao ausencia de dado
 
 PRICE_PERIOD = "2y"
 BATCH_SIZE = 200                    # tickers por chamada de yf.download
@@ -80,6 +84,20 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("screener")
+
+# Contador de motivos de descarte. Sem isso, um resultado vazio e indistinguivel
+# de um bug: o log final mostra exatamente onde o funil estrangulou.
+REJECTIONS: Counter = Counter()
+_LOCK = threading.Lock()
+
+
+def reject(reason: str) -> None:
+    with _LOCK:
+        REJECTIONS[reason] += 1
+
+
+def reject_report() -> list[tuple[str, int]]:
+    return sorted(REJECTIONS.items(), key=lambda kv: kv[1], reverse=True)
 
 
 # ---------------------------------------------------------------------------
@@ -402,11 +420,13 @@ def technical_snapshot(ticker: str, df: pd.DataFrame) -> dict | None:
         volume = df["Volume"].fillna(0) if "Volume" in df else pd.Series(0, index=close.index)
 
         if len(close) < MIN_HISTORY_BARS:
+            reject("tecnico: historico insuficiente (<220 pregoes)")
             return None
 
         price = float(close.iloc[-1])
         prev = float(close.iloc[-2])
         if not np.isfinite(price) or price < MIN_PRICE_LOCAL:
+            reject("tecnico: preco invalido ou abaixo do minimo")
             return None
 
         ma50 = float(close.rolling(50).mean().iloc[-1])
@@ -414,28 +434,35 @@ def technical_snapshot(ticker: str, df: pd.DataFrame) -> dict | None:
         ma200_series = close.rolling(200).mean()
         ma200 = float(ma200_series.iloc[-1])
         if not all(np.isfinite(v) for v in (ma50, ma150, ma200)):
+            reject("tecnico: medias moveis com dado quebrado")
             return None
 
-        # --- criterio obrigatorio do usuario ---
+        # --- criterio obrigatorio: empilhamento das medias ---
         if not (price > ma50 > ma150 > ma200):
+            reject("tecnico: nao respeita Preco > MM50 > MM150 > MM200")
             return None
 
         if REQUIRE_MA200_RISING:
             ref = float(ma200_series.iloc[-22])
             if not np.isfinite(ref) or ma200 <= ref:
+                reject("tecnico: MM200 nao esta subindo")
                 return None
 
         window = close.iloc[-252:] if len(close) >= 252 else close
         high52, low52 = float(window.max()), float(window.min())
         if low52 <= 0:
+            reject("tecnico: minima de 52 semanas invalida")
             return None
         if (price / low52 - 1.0) < MIN_PCT_ABOVE_52W_LOW:
+            reject("tecnico: menos de 30% acima da minima de 52s")
             return None
         if (1.0 - price / high52) > MAX_PCT_BELOW_52W_HIGH:
+            reject("tecnico: mais de 25% abaixo da maxima de 52s")
             return None
 
         turnover = float((volume.iloc[-50:].mean() or 0) * price)
         if turnover < MIN_AVG_TURNOVER_LOCAL:
+            reject("tecnico: liquidez abaixo do minimo")
             return None
 
         return {
@@ -457,7 +484,8 @@ def technical_snapshot(ticker: str, df: pd.DataFrame) -> dict | None:
             "rs_6m_pct": round((price / float(close.iloc[-126]) - 1.0) * 100, 2)
             if len(close) >= 126 and float(close.iloc[-126]) > 0 else None,
         }
-    except Exception:
+    except Exception as exc:
+        reject(f"tecnico: excecao ({type(exc).__name__})")
         return None
 
 
@@ -522,17 +550,24 @@ def _cache_path(ticker: str) -> str:
 
 
 def _read_cache(ticker: str) -> dict | None:
+    """
+    Sucesso vale FUNDAMENTALS_TTL_DAYS. Falha vale apenas FAILURE_TTL_HOURS,
+    porque uma falha costuma ser bloqueio temporario do Yahoo, nao ausencia
+    real de balanco. Cachear falha por semanas congela o screener em zero.
+    """
     path = _cache_path(ticker)
     if not os.path.exists(path):
         return None
-    age_days = (time.time() - os.path.getmtime(path)) / 86400
-    if age_days > FUNDAMENTALS_TTL_DAYS:
-        return None
     try:
         with open(path, encoding="utf-8") as fh:
-            return json.load(fh)
+            payload = json.load(fh)
     except Exception:
         return None
+
+    age_hours = (time.time() - os.path.getmtime(path)) / 3600
+    if not payload:                                   # {} = falha registrada
+        return None if age_hours > FAILURE_TTL_HOURS else {}
+    return None if age_hours > FUNDAMENTALS_TTL_DAYS * 24 else payload
 
 
 def _write_cache(ticker: str, payload: dict) -> None:
@@ -544,17 +579,27 @@ def _write_cache(ticker: str, payload: dict) -> None:
         pass
 
 
+def _fail(ticker: str, reason: str) -> None:
+    """Registra o motivo, memoriza a falha por pouco tempo e descarta."""
+    reject(reason)
+    _write_cache(ticker, {})
+    return None
+
+
 def fetch_fundamentals(ticker: str, use_cache: bool = True) -> dict | None:
     """
     Retorna metricas LTM. Qualquer dado quebrado/ausente -> None (descarta).
 
-    ROIC  = NOPAT LTM / IC medio (atual e 4 trimestres atras)
-    ROIIC = (NOPAT LTM - NOPAT LTM anterior) / (IC atual - IC ha 1 ano)
+    ROIC  = NOPAT LTM / Capital Investido medio
+    ROIIC = variacao do NOPAT / variacao do Capital Investido
     """
     if use_cache:
         cached = _read_cache(ticker)
         if cached is not None:
-            return cached or None          # {} em cache = falha conhecida
+            if not cached:
+                reject("fundamento: falha recente em cache")
+                return None
+            return cached
 
     time.sleep(random.uniform(*FUNDAMENTAL_JITTER))
 
@@ -573,11 +618,9 @@ def fetch_fundamentals(ticker: str, use_cache: bool = True) -> dict | None:
             inc, bal = t.income_stmt, t.balance_sheet
             step, span = 1, 1
             if inc is None or inc.empty or inc.shape[1] < 2:
-                _write_cache(ticker, {})
-                return None
+                return _fail(ticker, "fundamento: DRE indisponivel (bloqueio ou sem dado)")
             if bal is None or bal.empty or bal.shape[1] < 2:
-                _write_cache(ticker, {})
-                return None
+                return _fail(ticker, "fundamento: balanco indisponivel")
 
         ebit_s = _row(inc, ["EBIT", "Operating Income", "Total Operating Income As Reported"])
         tax_s = _row(inc, ["Tax Provision", "Income Tax Expense"])
@@ -588,9 +631,12 @@ def fetch_fundamentals(ticker: str, use_cache: bool = True) -> dict | None:
 
         ebit_ltm = _sum_window(ebit_s, 0, span)
         ebit_prior = _sum_window(ebit_s, step, span)
-        if ebit_ltm is None or ebit_prior is None or ebit_ltm <= 0:
-            _write_cache(ticker, {})
-            return None
+        if ebit_ltm is None:
+            return _fail(ticker, "fundamento: sem linha de EBIT / lucro operacional")
+        if ebit_ltm <= 0:
+            return _fail(ticker, "fundamento: EBIT negativo ou zero")
+        if ebit_prior is None:
+            return _fail(ticker, "fundamento: sem historico p/ comparar (ROIIC)")
 
         tax_ltm = _sum_window(tax_s, 0, span)
         pretax_ltm = _sum_window(pretax_s, 0, span)
@@ -606,18 +652,15 @@ def fetch_fundamentals(ticker: str, use_cache: bool = True) -> dict | None:
         ic_now = _invested_capital(bal, 0)
         ic_prior = _invested_capital(bal, step)
         if ic_now is None or ic_prior is None:
-            _write_cache(ticker, {})
-            return None
+            return _fail(ticker, "fundamento: capital investido nao calculavel")
 
         ic_avg = (ic_now + ic_prior) / 2
         if ic_avg <= 0:
-            _write_cache(ticker, {})
-            return None
+            return _fail(ticker, "fundamento: capital investido negativo")
 
         roic = nopat_ltm / ic_avg
         if not np.isfinite(roic):
-            _write_cache(ticker, {})
-            return None
+            return _fail(ticker, "fundamento: ROIC invalido")
 
         delta_nopat = nopat_ltm - nopat_prior
         delta_ic = ic_now - ic_prior
@@ -685,16 +728,21 @@ def fetch_fundamentals(ticker: str, use_cache: bool = True) -> dict | None:
 
     except Exception as exc:
         log.debug("Fundamentos falharam para %s: %s", ticker, exc)
-        _write_cache(ticker, {})
-        return None
+        return _fail(ticker, f"fundamento: excecao ({type(exc).__name__})")
 
 
 def passes_quality(f: dict) -> bool:
-    if f.get("roic") is None or f["roic"] <= MIN_ROIC:
+    if f.get("roic") is None:
+        reject("qualidade: ROIC ausente")
+        return False
+    if f["roic"] <= MIN_ROIC:
+        reject(f"qualidade: ROIC abaixo de {MIN_ROIC:.0%}")
         return False
     if REQUIRE_ROIIC_ABOVE_ROIC and (f.get("roiic") is None or f["roiic"] <= f["roic"]):
+        reject("qualidade: ROIIC nao supera o ROIC")
         return False
     if EXCLUDE_SECTORS_ENABLED and f.get("sector") in EXCLUDED_SECTORS:
+        reject(f"qualidade: setor excluido ({f.get('sector')})")
         return False
     return True
 
@@ -752,6 +800,11 @@ def run(markets: list[str], expand: bool, use_cache: bool) -> dict:
             clean.append(w)
     clean.sort(key=lambda r: r.get("roic", 0), reverse=True)
 
+    log.info("---- Funil de descarte ----")
+    for reason, count in reject_report()[:12]:
+        log.info("  %-52s %5d", reason, count)
+    log.info("---------------------------")
+
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "universe_size": len(universe),
@@ -768,6 +821,7 @@ def run(markets: list[str], expand: bool, use_cache: bool) -> dict:
             "excluded_sectors": sorted(EXCLUDED_SECTORS) if EXCLUDE_SECTORS_ENABLED else [],
         },
         "elapsed_seconds": round(time.time() - t0, 1),
+        "rejections": dict(reject_report()),
         "winners": clean,
     }
 
@@ -781,6 +835,61 @@ def run(markets: list[str], expand: bool, use_cache: bool) -> dict:
     return payload
 
 
+def diagnose(ticker: str) -> None:
+    """Inspeciona um unico ticker e imprime onde ele passa ou trava."""
+    print(f"\n=== DIAGNOSTICO: {ticker} ===\n")
+
+    prices = download_prices([ticker])
+    if ticker not in prices:
+        print("PRECOS: nada retornado. Ticker errado, sufixo errado ou bloqueio do Yahoo.")
+        return
+    df = prices[ticker]
+    close = df["Close"].dropna()
+    print(f"PRECOS: {len(close)} pregoes, de {close.index[0].date()} a {close.index[-1].date()}")
+    price = float(close.iloc[-1])
+    ma50 = float(close.rolling(50).mean().iloc[-1])
+    ma150 = float(close.rolling(150).mean().iloc[-1])
+    ma200 = float(close.rolling(200).mean().iloc[-1])
+    print(f"  Preco {price:,.2f} | MM50 {ma50:,.2f} | MM150 {ma150:,.2f} | MM200 {ma200:,.2f}")
+    print(f"  Empilhamento correto? {'SIM' if price > ma50 > ma150 > ma200 else 'NAO'}")
+
+    REJECTIONS.clear()
+    snap = technical_snapshot(ticker, df)
+    if snap is None:
+        print(f"  REPROVADO NO TECNICO -> {reject_report()[0][0] if reject_report() else '?'}")
+    else:
+        print("  APROVADO NO TECNICO")
+
+    print()
+    REJECTIONS.clear()
+    fund = fetch_fundamentals(ticker, use_cache=False)
+    if fund is None:
+        print(f"FUNDAMENTOS: falhou -> {reject_report()[0][0] if reject_report() else '?'}")
+        return
+    print(f"FUNDAMENTOS ({fund['basis']}):")
+    print(f"  Empresa       {fund.get('name')}  |  setor: {fund.get('sector')}")
+    print(f"  EBIT LTM      {fund.get('ebit_ltm'):,.0f}")
+    print(f"  Cap. Investido {fund.get('invested_capital'):,.0f}")
+    print(f"  ROIC          {fund['roic']:.2%}   (minimo exigido: {MIN_ROIC:.0%})")
+    print(f"  ROIIC         {fund['roiic']:.2%}   (precisa superar o ROIC)")
+
+    REJECTIONS.clear()
+    ok = passes_quality(fund)
+    print(f"\n  RESULTADO: {'APROVADO' if ok else 'REPROVADO -> ' + reject_report()[0][0]}")
+
+
+def apply_relaxed_preset() -> None:
+    """Afrouxa os cortes para diagnosticar um resultado vazio."""
+    global MIN_ROIC, REQUIRE_ROIIC_ABOVE_ROIC, REQUIRE_MA200_RISING
+    global MIN_PCT_ABOVE_52W_LOW, MAX_PCT_BELOW_52W_HIGH
+    MIN_ROIC = 0.10
+    REQUIRE_ROIIC_ABOVE_ROIC = False
+    REQUIRE_MA200_RISING = False
+    MIN_PCT_ABOVE_52W_LOW = 0.10
+    MAX_PCT_BELOW_52W_HIGH = 0.35
+    log.info("MODO RELAXADO: ROIC>10%, ROIIC livre, MM200 livre")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Screener Minervini + ROIC/ROIIC")
     ap.add_argument("--markets", default=",".join(CURATED.keys()),
@@ -788,7 +897,16 @@ def main() -> None:
     ap.add_argument("--quick", action="store_true", help="So listas curadas")
     ap.add_argument("--no-expand", action="store_true", help="Nao busca indices na web")
     ap.add_argument("--no-cache", action="store_true", help="Ignora cache de fundamentos")
+    ap.add_argument("--relax", action="store_true", help="Afrouxa os cortes (diagnostico)")
+    ap.add_argument("--diagnose", metavar="TICKER", help="Inspeciona um unico ticker")
     args = ap.parse_args()
+
+    if args.diagnose:
+        diagnose(args.diagnose.strip().upper())
+        return
+
+    if args.relax:
+        apply_relaxed_preset()
 
     markets = [m.strip().upper() for m in args.markets.split(",") if m.strip()]
     unknown = [m for m in markets if m not in CURATED]
