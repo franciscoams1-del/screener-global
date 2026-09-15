@@ -1,0 +1,64 @@
+name: Atualiza screener
+
+on:
+  schedule:
+    # 22:10 UTC = 19:10 de Brasília (seg-sex), depois do fechamento de Nova York.
+    - cron: "10 22 * * 1-5"
+
+  workflow_dispatch:        # botão "Run workflow" na aba Actions
+    inputs:
+      modo:
+        description: "Tamanho da varredura"
+        type: choice
+        default: rapido
+        options:
+          - rapido          # ~700 papéis, 3-5 minutos (use para testar)
+          - completo        # ~3.000 papéis, 25-45 minutos
+
+permissions:
+  contents: write           # necessário para gravar o winners_data.json no repositório
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Instala dependências
+        run: pip install -r requirements.txt
+
+      # Guarda os balanços já baixados entre execuções. Sem isso, todo dia
+      # o robô refaria centenas de consultas de fundamentos do zero.
+      - name: Restaura cache de fundamentos
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: fundamentals-${{ github.run_id }}
+          restore-keys: fundamentals-
+
+      - name: Roda o screener
+        run: |
+          if [ "${{ inputs.modo }}" = "rapido" ]; then
+            python screener_backend.py --quick
+          else
+            python screener_backend.py
+          fi
+
+      - name: Salva o resultado no repositório
+        run: |
+          git config user.name "screener-bot"
+          git config user.email "actions@github.com"
+          git add winners_data.json
+          if git diff --staged --quiet; then
+            echo "Nenhuma mudança no resultado."
+          else
+            git commit -m "Atualiza screener ($(date -u +%Y-%m-%d))"
+            git push
+          fi
