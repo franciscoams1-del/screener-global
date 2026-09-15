@@ -1,0 +1,47 @@
+name: Testar conexao com o Yahoo
+
+# Roda só quando você clicar em "Run workflow". Leva menos de 1 minuto.
+on:
+  workflow_dispatch:
+
+jobs:
+  teste:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1) Codigo HTTP que o Yahoo devolve
+        run: |
+          echo "=============================================="
+          echo " Perguntando o preco da Apple direto ao Yahoo"
+          echo "=============================================="
+          curl -s -o /dev/null -w "RESPOSTA DO YAHOO: HTTP %{http_code}\n" \
+            -H "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)" \
+            "https://query2.finance.yahoo.com/v8/finance/chart/AAPL?range=5d&interval=1d"
+          echo ""
+          echo " 200 = liberado   |   429 = bloqueado por excesso de acessos"
+          echo " 401/403 = recusado   |   000 = nem conseguiu conectar"
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: 2) Teste real com o yfinance
+        run: |
+          pip install --quiet --upgrade yfinance curl_cffi
+          python - <<'PY'
+          import yfinance as yf
+          print("versao do yfinance:", yf.__version__)
+
+          df = yf.download("AAPL", period="5d", interval="1d",
+                           progress=False, auto_adjust=True)
+          print("\nLINHAS RECEBIDAS PARA AAPL:", len(df))
+          if len(df):
+              print(df.tail(3))
+              print("\n>>> CONEXAO OK. O problema nao e bloqueio.")
+          else:
+              print("\n>>> VEIO VAZIO. O IP do GitHub esta bloqueado pelo Yahoo.")
+
+          lote = yf.download(["MSFT", "NVDA", "SAP.DE", "7203.T"],
+                             period="5d", interval="1d", group_by="ticker",
+                             progress=False, auto_adjust=True)
+          print("\nTESTE EM LOTE (4 tickers): ", "OK" if len(lote) else "VAZIO")
+          PY
