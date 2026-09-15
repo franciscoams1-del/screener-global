@@ -62,8 +62,12 @@ MIN_BATCH_RETRY = 20                # lote que falha e dividido ao meio ate este
 PAUSE_BETWEEN_BATCHES = 1.5         # segundos (evita 429 / IP ban)
 PRICE_THREADS = 8                   # threads internas do yfinance por lote
 
-FUNDAMENTAL_WORKERS = 5             # conservador de proposito: evita bloqueio
-FUNDAMENTAL_JITTER = (0.4, 1.2)     # sleep aleatorio por requisicao
+FUNDAMENTAL_WORKERS = 2             # o Yahoo limita fundamentos com severidade
+FUNDAMENTAL_JITTER = (1.2, 2.8)     # sleep aleatorio por requisicao
+USE_QUARTERLY = False               # anual = 2 requisicoes; trimestral = 4.
+                                    # Ligue so se precisar de LTM exato.
+RATE_LIMIT_ATTEMPTS = 3             # tentativas quando o Yahoo barra
+RATE_LIMIT_BACKOFF = 8.0            # segundos na 1a espera (dobra a cada vez)
 
 # --- Criterios do screener -------------------------------------------------
 MIN_ROIC = 0.15                     # ROIC LTM > 15%
@@ -661,6 +665,40 @@ def _invested_capital(bs: pd.DataFrame | None, pos: int) -> float | None:
     return ic if ic > 0 else None
 
 
+RATE_LIMIT_HINTS = ("ratelimit", "rate limit", "too many requests", "429")
+
+
+def _is_rate_limit(exc: Exception) -> bool:
+    """O yfinance 1.x levanta YFRateLimitError, mas nem sempre: as vezes so
+    devolve tabela vazia. Reconhecemos os dois casos."""
+    blob = (type(exc).__name__ + " " + str(exc)).lower()
+    return any(h in blob for h in RATE_LIMIT_HINTS)
+
+
+def _fetch_statement(ticker_obj, attr: str) -> pd.DataFrame | None:
+    """
+    Busca um demonstrativo com espera progressiva. Tabela vazia e tratada
+    como possivel bloqueio, nao como ausencia de dado: essa confusao foi o
+    que fez tres de cada quatro empresas serem descartadas por engano.
+    """
+    for tentativa in range(RATE_LIMIT_ATTEMPTS):
+        try:
+            df = getattr(ticker_obj, attr)
+            if df is not None and not df.empty:
+                return df
+            erro_str = "tabela vazia"
+        except Exception as exc:
+            if not _is_rate_limit(exc) and tentativa == 0:
+                raise
+            erro_str = type(exc).__name__
+
+        if tentativa < RATE_LIMIT_ATTEMPTS - 1:
+            espera = RATE_LIMIT_BACKOFF * (2 ** tentativa) + random.uniform(0, 2)
+            log.debug("%s: %s, esperando %.1fs", attr, erro_str, espera)
+            time.sleep(espera)
+    return None
+
+
 def _cache_path(ticker: str) -> str:
     safe = ticker.replace("/", "_").replace("\\", "_")
     return os.path.join(FUNDAMENTALS_CACHE, f"{safe}.json")
@@ -703,12 +741,19 @@ def _fail(ticker: str, reason: str) -> None:
     return None
 
 
+def _fail_nocache(ticker: str, reason: str) -> None:
+    """Falha por bloqueio: NAO memoriza, para a proxima rodada tentar de novo."""
+    reject(reason)
+    return None
+
+
 def fetch_fundamentals(ticker: str, use_cache: bool = True) -> dict | None:
     """
-    Retorna metricas LTM. Qualquer dado quebrado/ausente -> None (descarta).
+    Calcula ROIC e ROIIC com o MINIMO de requisicoes possivel.
 
-    ROIC  = NOPAT LTM / Capital Investido medio
-    ROIIC = variacao do NOPAT / variacao do Capital Investido
+    Por padrao usa so os demonstrativos anuais (2 chamadas). Setor e nome
+    da empresa NAO sao buscados aqui: isso exige o endpoint mais limitado
+    do Yahoo e so vale a pena para quem ja passou nos cortes.
     """
     if use_cache:
         cached = _read_cache(ticker)
@@ -722,22 +767,29 @@ def fetch_fundamentals(ticker: str, use_cache: bool = True) -> dict | None:
 
     try:
         t = yf.Ticker(ticker)
-        qis = t.quarterly_income_stmt
-        qbs = t.quarterly_balance_sheet
-        quarterly_ok = (
-            qis is not None and not qis.empty and qis.shape[1] >= 8
-            and qbs is not None and not qbs.empty and qbs.shape[1] >= 5
-        )
 
-        if quarterly_ok:
-            inc, bal, step, span = qis, qbs, 4, 4       # LTM = 4 trimestres
-        else:                                            # fallback anual
-            inc, bal = t.income_stmt, t.balance_sheet
-            step, span = 1, 1
-            if inc is None or inc.empty or inc.shape[1] < 2:
-                return _fail(ticker, "fundamento: DRE indisponivel (bloqueio ou sem dado)")
-            if bal is None or bal.empty or bal.shape[1] < 2:
-                return _fail(ticker, "fundamento: balanco indisponivel")
+        inc = bal = None
+        step = span = 1
+        if USE_QUARTERLY:
+            qis = _fetch_statement(t, "quarterly_income_stmt")
+            qbs = _fetch_statement(t, "quarterly_balance_sheet")
+            if (qis is not None and qis.shape[1] >= 8
+                    and qbs is not None and qbs.shape[1] >= 5):
+                inc, bal, step, span = qis, qbs, 4, 4
+
+        if inc is None:
+            inc = _fetch_statement(t, "income_stmt")
+            bal = _fetch_statement(t, "balance_sheet")
+            step = span = 1
+
+        if inc is None:
+            return _fail_nocache(ticker, "fundamento: DRE nao veio (provavel bloqueio)")
+        if inc.shape[1] < 2:
+            return _fail(ticker, "fundamento: DRE com menos de 2 exercicios")
+        if bal is None:
+            return _fail_nocache(ticker, "fundamento: balanco nao veio (provavel bloqueio)")
+        if bal.shape[1] < 2:
+            return _fail(ticker, "fundamento: balanco com menos de 2 exercicios")
 
         ebit_s = _row(inc, ["EBIT", "Operating Income", "Total Operating Income As Reported"])
         tax_s = _row(inc, ["Tax Provision", "Income Tax Expense"])
@@ -784,44 +836,25 @@ def fetch_fundamentals(ticker: str, use_cache: bool = True) -> dict | None:
         if delta_ic > 0:
             roiic = delta_nopat / delta_ic
         elif TREAT_CAPITAL_RELEASE_AS_PASS and delta_nopat > 0:
-            roiic = ROIIC_CAP          # cresceu lucro liberando capital
+            roiic = ROIIC_CAP
         else:
             roiic = -ROIIC_CAP
         roiic = float(max(-ROIIC_CAP, min(ROIIC_CAP, roiic)))
 
-        # --- metricas de vitrine (modal) ---
         rev_ltm = _sum_window(rev_s, 0, span)
         ni_ltm = _sum_window(ni_s, 0, span)
         eps_ltm = _sum_window(eps_s, 0, span)
         op_margin = (ebit_ltm / rev_ltm) if rev_ltm and rev_ltm > 0 else None
 
-        fast = t.fast_info
-        market_cap = getattr(fast, "market_cap", None)
-        currency = getattr(fast, "currency", None)
-        last_price = getattr(fast, "last_price", None)
-
         total_debt = _at(_row(bal, ["Total Debt"]), 0) or 0.0
         cash = _at(_row(bal, ["Cash And Cash Equivalents",
                               "Cash Cash Equivalents And Short Term Investments"]), 0) or 0.0
-        net_debt = total_debt - cash
-        ev = (market_cap + net_debt) if market_cap else None
-        pe = (last_price / eps_ltm) if (last_price and eps_ltm and eps_ltm > 0) else None
-
-        sector, industry, name = None, None, ticker
-        try:
-            info = t.get_info()
-            sector = info.get("sector")
-            industry = info.get("industry")
-            name = info.get("shortName") or info.get("longName") or ticker
-            market_cap = market_cap or info.get("marketCap")
-        except Exception:
-            pass
 
         payload = {
-            "name": name,
-            "sector": sector,
-            "industry": industry,
-            "currency": currency,
+            "name": ticker,
+            "sector": None,
+            "industry": None,
+            "currency": None,
             "roic": round(float(roic), 4),
             "roiic": round(float(roiic), 4),
             "tax_rate": round(float(tax_rate), 4),
@@ -832,20 +865,59 @@ def fetch_fundamentals(ticker: str, use_cache: bool = True) -> dict | None:
             "net_income_ltm": float(ni_ltm) if ni_ltm else None,
             "eps_ltm": round(float(eps_ltm), 4) if eps_ltm else None,
             "operating_margin": round(float(op_margin), 4) if op_margin else None,
-            "pe_ratio": round(float(pe), 2) if pe else None,
-            "market_cap": float(market_cap) if market_cap else None,
-            "enterprise_value": float(ev) if ev else None,
-            "net_debt": float(net_debt),
+            "pe_ratio": None,
+            "market_cap": None,
+            "enterprise_value": None,
+            "net_debt": float(total_debt - cash),
             "total_debt": float(total_debt),
             "cash": float(cash),
-            "basis": "quarterly_ltm" if quarterly_ok else "annual",
+            "basis": "quarterly_ltm" if span == 4 else "annual",
         }
         _write_cache(ticker, payload)
         return payload
 
     except Exception as exc:
         log.debug("Fundamentos falharam para %s: %s", ticker, exc)
+        if _is_rate_limit(exc):
+            return _fail_nocache(ticker, "fundamento: bloqueado pelo Yahoo")
         return _fail(ticker, f"fundamento: excecao ({type(exc).__name__})")
+
+
+def enrich(ticker: str, payload: dict) -> dict:
+    """
+    Busca nome, setor e valor de mercado. Roda SO para quem ja passou nos
+    cortes, porque este e o endpoint mais estrangulado do Yahoo (cerca de
+    10 chamadas por minuto). Falhar aqui nao elimina a empresa.
+    """
+    time.sleep(random.uniform(*FUNDAMENTAL_JITTER))
+    try:
+        t = yf.Ticker(ticker)
+        try:
+            fast = t.fast_info
+            payload["market_cap"] = getattr(fast, "market_cap", None)
+            payload["currency"] = getattr(fast, "currency", None)
+            last_price = getattr(fast, "last_price", None)
+        except Exception:
+            last_price = None
+
+        try:
+            info = t.get_info()
+            payload["sector"] = info.get("sector")
+            payload["industry"] = info.get("industry")
+            payload["name"] = info.get("shortName") or info.get("longName") or ticker
+            payload["market_cap"] = payload["market_cap"] or info.get("marketCap")
+        except Exception:
+            pass
+
+        mc = payload.get("market_cap")
+        if mc:
+            payload["enterprise_value"] = float(mc) + payload.get("net_debt", 0.0)
+        eps = payload.get("eps_ltm")
+        if last_price and eps and eps > 0:
+            payload["pe_ratio"] = round(float(last_price) / float(eps), 2)
+    except Exception:
+        pass
+    return payload
 
 
 def passes_quality(f: dict) -> bool:
@@ -858,7 +930,14 @@ def passes_quality(f: dict) -> bool:
     if REQUIRE_ROIIC_ABOVE_ROIC and (f.get("roiic") is None or f["roiic"] <= f["roic"]):
         reject("qualidade: ROIIC nao supera o ROIC")
         return False
-    if EXCLUDE_SECTORS_ENABLED and f.get("sector") in EXCLUDED_SECTORS:
+    return True
+
+
+def sector_allowed(f: dict) -> bool:
+    """Checado depois do enriquecimento. Setor desconhecido nao elimina."""
+    if not EXCLUDE_SECTORS_ENABLED:
+        return True
+    if f.get("sector") in EXCLUDED_SECTORS:
         reject(f"qualidade: setor excluido ({f.get('sector')})")
         return False
     return True
@@ -908,6 +987,18 @@ def run(markets: list[str], expand: bool, use_cache: bool) -> dict:
                 if not fund or not passes_quality(fund):
                     continue
                 winners.append({**snap, **fund})
+
+        # Segunda passada, so nos finalistas: nome, setor, valor de mercado.
+        log.info("Enriquecendo %d finalistas (nome, setor, market cap)...", len(winners))
+        enriquecidos = []
+        with ThreadPoolExecutor(max_workers=FUNDAMENTAL_WORKERS) as pool:
+            futs = {pool.submit(enrich, w["ticker"], dict(w)): w for w in winners}
+            for fut in as_completed(futs):
+                try:
+                    enriquecidos.append(fut.result())
+                except Exception:
+                    enriquecidos.append(futs[fut])
+        winners = [w for w in enriquecidos if sector_allowed(w)]
 
     # Limpeza final: remove qualquer registro com NaN/inf residual.
     clean: list[dict] = []
