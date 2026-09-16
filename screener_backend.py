@@ -255,9 +255,36 @@ HK = [  # Hong Kong Stock Exchange
     "1109.HK", "0960.HK", "1997.HK", "0823.HK", "0806.HK",
 ]
 
+
+BR = [  # B3 — Brasil (sufixo .SA)
+    "PETR4.SA", "PETR3.SA", "VALE3.SA", "ITUB4.SA", "ITUB3.SA", "BBDC4.SA",
+    "BBDC3.SA", "BBAS3.SA", "BPAC11.SA", "SANB11.SA", "BPAN4.SA", "B3SA3.SA",
+    "ABEV3.SA", "WEGE3.SA", "ITSA4.SA", "RENT3.SA", "SUZB3.SA", "PRIO3.SA",
+    "RAIL3.SA", "EQTL3.SA", "RDOR3.SA", "GGBR4.SA", "GOAU4.SA", "CSNA3.SA",
+    "USIM5.SA", "KLBN11.SA", "JBSS3.SA", "MRFG3.SA", "BRFS3.SA", "BEEF3.SA",
+    "SMTO3.SA", "SLCE3.SA", "AGRO3.SA", "TTEN3.SA", "CAML3.SA", "MDIA3.SA",
+    "TOTS3.SA", "LWSA3.SA", "POSI3.SA", "INTB3.SA", "CASH3.SA", "NGRD3.SA",
+    "VIVT3.SA", "TIMS3.SA", "ELET3.SA", "ELET6.SA", "CMIG4.SA", "CPLE6.SA",
+    "CPFE3.SA", "ENGI11.SA", "EGIE3.SA", "TAEE11.SA", "AURE3.SA", "NEOE3.SA",
+    "ENEV3.SA", "ALUP11.SA", "SBSP3.SA", "SAPR11.SA", "CSMG3.SA", "ORVR3.SA",
+    "AMBP3.SA", "RAIZ4.SA", "VBBR3.SA", "UGPA3.SA", "CSAN3.SA", "LREN3.SA",
+    "MGLU3.SA", "PETZ3.SA", "ASAI3.SA", "CRFB3.SA", "PCAR3.SA", "NTCO3.SA",
+    "SBFG3.SA", "VIVA3.SA", "CEAB3.SA", "GMAT3.SA", "VULC3.SA", "GRND3.SA",
+    "ALPA4.SA", "AZZA3.SA", "CVCB3.SA", "AZUL4.SA", "GOLL4.SA", "EMBR3.SA",
+    "POMO4.SA", "RAPT4.SA", "TUPY3.SA", "MYPK3.SA", "LEVE3.SA", "FRAS3.SA",
+    "KEPL3.SA", "ROMI3.SA", "MILS3.SA", "TASA4.SA", "UNIP6.SA", "BRKM5.SA",
+    "DTEX3.SA", "RANI3.SA", "HAPV3.SA", "FLRY3.SA", "DASA3.SA", "PNVL3.SA",
+    "RADL3.SA", "HYPE3.SA", "ODPV3.SA", "ONCO3.SA", "CYRE3.SA", "EZTC3.SA",
+    "MRVE3.SA", "DIRR3.SA", "TEND3.SA", "CURY3.SA", "PLPL3.SA", "MDNE3.SA",
+    "TRIS3.SA", "LOGG3.SA", "MULT3.SA", "IGTI11.SA", "ALOS3.SA", "SYNE3.SA",
+    "JHSF3.SA", "STBP3.SA", "PSSA3.SA", "CXSE3.SA", "BBSE3.SA", "IRBR3.SA",
+    "MOVI3.SA", "VAMO3.SA", "SIMH3.SA", "YDUQ3.SA", "COGN3.SA", "SEER3.SA",
+    "ANIM3.SA", "ARML3.SA", "ESPA3.SA", "VITT3.SA", "SRNA3.SA",
+]
+
 CURATED: dict[str, list[str]] = {
     "US": US, "CA": CA, "GB": GB, "DE": DE, "CH": CH,
-    "FR": FR, "IT": IT, "JP": JP, "KR": KR, "HK": HK,
+    "FR": FR, "IT": IT, "JP": JP, "KR": KR, "HK": HK, "BR": BR,
 }
 
 # --- Expansao automatica ---------------------------------------------------
@@ -279,6 +306,8 @@ INDEX_SOURCES: list[tuple[str, str, str, str]] = [
     ("CH", "https://en.wikipedia.org/wiki/Swiss_Market_Index", "Ticker", ".SW"),
     ("JP", "https://en.wikipedia.org/wiki/Nikkei_225", "Ticker", ".T"),
     ("HK", "https://en.wikipedia.org/wiki/Hang_Seng_Index", "Ticker", ".HK"),
+    ("BR", "https://pt.wikipedia.org/wiki/Lista_de_companhias_citadas_no_Ibovespa",
+     "Código", ".SA"),
 ]
 
 # A Wikipedia recusa requisicoes que nao se identificam como navegador
@@ -292,7 +321,8 @@ BROWSER_UA = (
 # Quantos tickers cada fonte rendeu nesta execucao (vai para o JSON final).
 UNIVERSE_SOURCES: dict[str, int] = {}
 
-TICKER_COLUMN_CANDIDATES = ["Symbol", "Ticker", "Ticker symbol", "Code", "Epic"]
+TICKER_COLUMN_CANDIDATES = ["Symbol", "Ticker", "Ticker symbol", "Code", "Epic",
+                            "Código", "Codigo"]
 
 
 def _normalize(sym: Any, suffix: str) -> str | None:
@@ -534,6 +564,71 @@ def download_prices(tickers: list[str]) -> dict[str, pd.DataFrame]:
 # 3. FILTRO TECNICO (MINERVINI)
 # ---------------------------------------------------------------------------
 
+def rs_raw(close: pd.Series) -> float | None:
+    """
+    Forca relativa no estilo Minervini/IBD: desempenho dos quatro trimestres
+    com peso maior no mais recente. E um numero BRUTO — so vira nota de 1 a 99
+    depois de comparado com todo o universo (ver rank_relative_strength).
+    """
+    if len(close) < 252:
+        return None
+    try:
+        p = [float(close.iloc[-1]), float(close.iloc[-63]), float(close.iloc[-126]),
+             float(close.iloc[-189]), float(close.iloc[-252])]
+    except Exception:
+        return None
+    if min(p) <= 0 or not all(np.isfinite(v) for v in p):
+        return None
+    return 0.4 * (p[0] / p[1]) + 0.2 * (p[1] / p[2]) + 0.2 * (p[2] / p[3]) + 0.2 * (p[3] / p[4])
+
+
+def wilder_rsi(close: pd.Series, periodo: int = 14) -> float | None:
+    """
+    IFR classico de Wilder (0 a 100). Mede sobrecompra/sobrevenda da propria
+    acao. NAO serve para ranquear: acima de 70 e sinal de esticada, nao de
+    qualidade. Entra como indicador de timing na tela de analise.
+    """
+    if len(close) < periodo * 3:
+        return None
+    try:
+        delta = close.diff()
+        ganho = delta.clip(lower=0)
+        perda = -delta.clip(upper=0)
+        media_ganho = ganho.ewm(alpha=1 / periodo, adjust=False).mean()
+        media_perda = perda.ewm(alpha=1 / periodo, adjust=False).mean()
+        ultima_perda = float(media_perda.iloc[-1])
+        if ultima_perda == 0:
+            return 100.0
+        rs = float(media_ganho.iloc[-1]) / ultima_perda
+        valor = 100 - (100 / (1 + rs))
+        return round(float(valor), 1) if np.isfinite(valor) else None
+    except Exception:
+        return None
+
+
+def rank_relative_strength(brutos: dict[str, float],
+                           alvos: list[dict]) -> None:
+    """
+    Converte a forca bruta em nota de 1 a 99 por percentil, comparando com
+    TODO o universo com preco — nao apenas com os aprovados. Uma nota 90
+    significa: rendeu mais que 90% das acoes varridas.
+    """
+    if not brutos:
+        return
+    serie = pd.Series(brutos).dropna()
+    if serie.empty:
+        return
+    percentis = serie.rank(pct=True) * 100
+    for alvo in alvos:
+        valor = percentis.get(alvo["ticker"])
+        if valor is not None and np.isfinite(valor):
+            alvo["rs_rating"] = int(max(1, min(99, round(float(valor)))))
+            alvo["rs_raw"] = round(float(serie[alvo["ticker"]]), 4)
+        else:
+            alvo["rs_rating"] = None
+            alvo["rs_raw"] = None
+
+
 def technical_snapshot(ticker: str, df: pd.DataFrame) -> dict | None:
     """Calcula medias e aplica o filtro de tendencia. None = reprovado."""
     try:
@@ -604,6 +699,8 @@ def technical_snapshot(ticker: str, df: pd.DataFrame) -> dict | None:
             "avg_turnover_50d": round(turnover, 0),
             "rs_6m_pct": round((price / float(close.iloc[-126]) - 1.0) * 100, 2)
             if len(close) >= 126 and float(close.iloc[-126]) > 0 else None,
+            "rsi_14": wilder_rsi(close),
+            "exchange": ticker.split(".")[-1] if "." in ticker else "US",
         }
     except Exception as exc:
         reject(f"tecnico: excecao ({type(exc).__name__})")
@@ -959,11 +1056,17 @@ def run(markets: list[str], expand: bool, use_cache: bool) -> dict:
 
     # --- etapa barata: tecnico em memoria ---
     survivors: list[dict] = []
+    forca_bruta: dict[str, float] = {}
     for tkr, df in prices.items():
+        bruto = rs_raw(df["Close"].dropna())
+        if bruto is not None:
+            forca_bruta[tkr] = bruto
         snap = technical_snapshot(tkr, df)
         if snap:
             survivors.append(snap)
     log.info("Aprovados no filtro tecnico: %d", len(survivors))
+    log.info("Forca relativa calculada sobre %d acoes do universo", len(forca_bruta))
+    rank_relative_strength(forca_bruta, survivors)
 
     if not survivors:
         log.warning("Nenhum ticker passou no tecnico. Nada a fazer.")
@@ -1006,7 +1109,10 @@ def run(markets: list[str], expand: bool, use_cache: bool) -> dict:
         bad = any(isinstance(v, float) and not math.isfinite(v) for v in w.values())
         if not bad:
             clean.append(w)
-    clean.sort(key=lambda r: r.get("roic", 0), reverse=True)
+    clean.sort(key=lambda r: (r.get("rs_rating") or 0, r.get("roic") or 0),
+               reverse=True)
+    for posicao, registro in enumerate(clean, 1):
+        registro["rank_rs"] = posicao
 
     log.info("---- Funil de descarte ----")
     for reason, count in reject_report()[:12]:
@@ -1104,7 +1210,7 @@ def apply_relaxed_preset() -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Screener Minervini + ROIC/ROIIC")
     ap.add_argument("--markets", default=",".join(CURATED.keys()),
-                    help="Mercados: US,CA,GB,DE,CH,FR,IT,JP,KR,HK")
+                    help="Mercados: US,CA,GB,DE,CH,FR,IT,JP,KR,HK,BR")
     ap.add_argument("--quick", action="store_true", help="So listas curadas")
     ap.add_argument("--no-expand", action="store_true", help="Nao busca indices na web")
     ap.add_argument("--no-cache", action="store_true", help="Ignora cache de fundamentos")
