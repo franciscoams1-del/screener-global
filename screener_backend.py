@@ -70,8 +70,9 @@ RATE_LIMIT_ATTEMPTS = 3             # tentativas quando o Yahoo barra
 RATE_LIMIT_BACKOFF = 8.0            # segundos na 1a espera (dobra a cada vez)
 
 # --- Criterios do screener -------------------------------------------------
-MIN_ROIC = 0.15                     # ROIC LTM > 15%
-REQUIRE_ROIIC_ABOVE_ROIC = True     # ROIIC LTM > ROIC LTM
+MIN_ROIC = 0.15                     # corte pela MEDIA DE 3 ANOS do ROIC
+ANOS_MEDIA = 3                      # janela das medias e dos CAGRs
+REQUIRE_ROIIC_ABOVE_ROIC = True     # ROIIC LTM > ROIC medio de 3 anos
 ROIIC_CAP = 9.99                    # teto p/ nao poluir o JSON com +infinito
 TREAT_CAPITAL_RELEASE_AS_PASS = True  # delta IC <= 0 e delta NOPAT > 0 -> passa
 
@@ -747,6 +748,45 @@ def _at(series: pd.Series | None, pos: int) -> float | None:
     return val if np.isfinite(val) else None
 
 
+def _cagr(serie: pd.Series | None, anos: int = ANOS_MEDIA) -> float | None:
+    """Taxa composta de crescimento entre o exercicio atual e o de `anos` atras."""
+    fim, inicio = _at(serie, 0), _at(serie, anos)
+    if fim is None or inicio is None:
+        return None
+    if inicio <= 0 or fim <= 0:          # CAGR nao existe com base negativa
+        return None
+    try:
+        return (fim / inicio) ** (1 / anos) - 1
+    except Exception:
+        return None
+
+
+def _media_anos(valores: list[float | None], minimo: int = 2) -> float | None:
+    """Media dos exercicios disponiveis. None se houver dado de menos."""
+    limpos = [v for v in valores if v is not None and np.isfinite(v)]
+    if len(limpos) < minimo:
+        return None
+    return sum(limpos) / len(limpos)
+
+
+def _razao(numerador: float | None, denominador: float | None) -> float | None:
+    if numerador is None or denominador is None or denominador <= 0:
+        return None
+    valor = numerador / denominador
+    return valor if np.isfinite(valor) else None
+
+
+def _capital_empregado(bal: pd.DataFrame | None, pos: int) -> float | None:
+    """ROCE usa Ativo Total menos Passivo Circulante."""
+    ativo = _at(_row(bal, ["Total Assets"]), pos)
+    circulante = _at(_row(bal, ["Current Liabilities",
+                                "Total Current Liabilities"]), pos)
+    if ativo is None or circulante is None:
+        return None
+    ce = ativo - circulante
+    return ce if ce > 0 else None
+
+
 def _invested_capital(bs: pd.DataFrame | None, pos: int) -> float | None:
     """IC = linha pronta do Yahoo, senao Divida Total + PL - Caixa."""
     ic = _at(_row(bs, ["Invested Capital"]), pos)
@@ -831,6 +871,76 @@ def _write_cache(ticker: str, payload: dict) -> None:
         pass
 
 
+def metricas_plurianuais(inc: pd.DataFrame, bal: pd.DataFrame,
+                         cf: pd.DataFrame | None,
+                         aliquota_padrao: float) -> dict:
+    """
+    Calcula as metricas de janela longa exibidas na analise. Cada uma retorna
+    None quando faltam exercicios — nunca um numero inventado.
+    """
+    n = ANOS_MEDIA
+    ebit_s = _row(inc, ["EBIT", "Operating Income"])
+    rev_s = _row(inc, ["Total Revenue", "Operating Revenue"])
+    gross_s = _row(inc, ["Gross Profit"])
+    ni_s = _row(inc, ["Net Income", "Net Income Common Stockholders"])
+    eps_s = _row(inc, ["Diluted EPS", "Basic EPS"])
+    tax_s = _row(inc, ["Tax Provision", "Income Tax Expense"])
+    pretax_s = _row(inc, ["Pretax Income", "Income Before Tax"])
+
+    capex_s = _row(cf, ["Capital Expenditure", "Capital Expenditures"]) if cf is not None else None
+    fcf_s = _row(cf, ["Free Cash Flow"]) if cf is not None else None
+    ocf_s = _row(cf, ["Operating Cash Flow",
+                      "Cash Flow From Continuing Operating Activities"]) if cf is not None else None
+
+    def aliquota(i: int) -> float:
+        imposto, antes = _at(tax_s, i), _at(pretax_s, i)
+        if imposto is not None and antes and antes > 0:
+            taxa = imposto / antes
+            if 0.0 <= taxa <= 0.50:
+                return taxa
+        return aliquota_padrao
+
+    roic_anos, roce_anos, gross_anos, fcf_anos, ni_anos = [], [], [], [], []
+    for i in range(n):
+        ebit_i = _at(ebit_s, i)
+        rev_i = _at(rev_s, i)
+
+        ic_i = _invested_capital(bal, i)
+        if ebit_i is not None and ic_i:
+            roic_anos.append(_razao(ebit_i * (1 - aliquota(i)), ic_i))
+
+        ce_i = _capital_empregado(bal, i)
+        if ebit_i is not None and ce_i:
+            roce_anos.append(_razao(ebit_i, ce_i))
+
+        gross_anos.append(_razao(_at(gross_s, i), rev_i))
+
+        fcf_i = _at(fcf_s, i)
+        if fcf_i is None:
+            ocf_i, capex_i = _at(ocf_s, i), _at(capex_s, i)
+            if ocf_i is not None and capex_i is not None:
+                fcf_i = ocf_i - abs(capex_i)   # capex vem negativo no Yahoo
+        fcf_anos.append(_razao(fcf_i, rev_i))
+
+        ni_anos.append(_at(ni_s, i))
+
+    capex_ltm = _at(capex_s, 0)
+    rev_ltm = _at(rev_s, 0)
+
+    return {
+        "revenue_cagr_3y": _cagr(rev_s),
+        "eps_cagr_3y": _cagr(eps_s),
+        "roic_3y_avg": _media_anos(roic_anos),
+        "roce_3y_avg": _media_anos(roce_anos),
+        "gross_margin_3y_avg": _media_anos(gross_anos),
+        "fcf_margin_3y_avg": _media_anos(fcf_anos),
+        "net_income_3y_avg": _media_anos(ni_anos),
+        "capex_to_revenue_ltm": _razao(abs(capex_ltm) if capex_ltm is not None else None,
+                                       rev_ltm),
+        "anos_disponiveis": int(min(inc.shape[1], bal.shape[1])),
+    }
+
+
 def _fail(ticker: str, reason: str) -> None:
     """Registra o motivo, memoriza a falha por pouco tempo e descarta."""
     reject(reason)
@@ -878,6 +988,10 @@ def fetch_fundamentals(ticker: str, use_cache: bool = True) -> dict | None:
             inc = _fetch_statement(t, "income_stmt")
             bal = _fetch_statement(t, "balance_sheet")
             step = span = 1
+
+        # Fluxo de caixa: necessario para CAPEX/Receita e margem de FCF.
+        # Ausencia NAO elimina a empresa; so deixa essas duas metricas vazias.
+        cf = _fetch_statement(t, "cashflow")
 
         if inc is None:
             return _fail_nocache(ticker, "fundamento: DRE nao veio (provavel bloqueio)")
@@ -943,6 +1057,8 @@ def fetch_fundamentals(ticker: str, use_cache: bool = True) -> dict | None:
         eps_ltm = _sum_window(eps_s, 0, span)
         op_margin = (ebit_ltm / rev_ltm) if rev_ltm and rev_ltm > 0 else None
 
+        extras = metricas_plurianuais(inc, bal, cf, tax_rate)
+
         total_debt = _at(_row(bal, ["Total Debt"]), 0) or 0.0
         cash = _at(_row(bal, ["Cash And Cash Equivalents",
                               "Cash Cash Equivalents And Short Term Investments"]), 0) or 0.0
@@ -970,6 +1086,7 @@ def fetch_fundamentals(ticker: str, use_cache: bool = True) -> dict | None:
             "cash": float(cash),
             "basis": "quarterly_ltm" if span == 4 else "annual",
         }
+        payload.update(extras)
         _write_cache(ticker, payload)
         return payload
 
@@ -1018,14 +1135,26 @@ def enrich(ticker: str, payload: dict) -> dict:
 
 
 def passes_quality(f: dict) -> bool:
-    if f.get("roic") is None:
+    """
+    Corte pela MEDIA DE 3 ANOS do ROIC: um exercicio atipico deixa de decidir
+    sozinho. Se a empresa nao tiver 3 exercicios, cai para o ROIC do ultimo.
+    """
+    referencia = f.get("roic_3y_avg")
+    rotulo = "ROIC 3 anos"
+    if referencia is None:
+        referencia = f.get("roic")
+        rotulo = "ROIC (sem 3 exercicios)"
+    if referencia is None:
         reject("qualidade: ROIC ausente")
         return False
-    if f["roic"] <= MIN_ROIC:
-        reject(f"qualidade: ROIC abaixo de {MIN_ROIC:.0%}")
+
+    f["roic_referencia"] = round(float(referencia), 4)
+
+    if referencia <= MIN_ROIC:
+        reject(f"qualidade: {rotulo} abaixo de {MIN_ROIC:.0%}")
         return False
-    if REQUIRE_ROIIC_ABOVE_ROIC and (f.get("roiic") is None or f["roiic"] <= f["roic"]):
-        reject("qualidade: ROIIC nao supera o ROIC")
+    if REQUIRE_ROIIC_ABOVE_ROIC and (f.get("roiic") is None or f["roiic"] <= referencia):
+        reject("qualidade: ROIIC nao supera o ROIC de 3 anos")
         return False
     return True
 
