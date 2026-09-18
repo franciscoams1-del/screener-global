@@ -51,6 +51,8 @@ OUTPUT_FILE = "winners_data.json"
 CACHE_DIR = "cache"
 FUNDAMENTALS_CACHE = os.path.join(CACHE_DIR, "fundamentals")
 FUNDAMENTALS_TTL_DAYS = 15          # balanco nao muda todo dia; cache agressivo
+CACHE_SCHEMA = 3                    # suba este numero ao mudar as metricas:
+                                    # invalida o cache automaticamente
 FAILURE_TTL_HOURS = 6               # falha NAO e cacheada por 15 dias: pode ser
                                     # bloqueio temporario do Yahoo, nao ausencia de dado
 
@@ -812,13 +814,15 @@ def _is_rate_limit(exc: Exception) -> bool:
     return any(h in blob for h in RATE_LIMIT_HINTS)
 
 
-def _fetch_statement(ticker_obj, attr: str) -> pd.DataFrame | None:
+def _fetch_statement(ticker_obj, attr: str,
+                     tentativas: int | None = None) -> pd.DataFrame | None:
     """
     Busca um demonstrativo com espera progressiva. Tabela vazia e tratada
     como possivel bloqueio, nao como ausencia de dado: essa confusao foi o
     que fez tres de cada quatro empresas serem descartadas por engano.
     """
-    for tentativa in range(RATE_LIMIT_ATTEMPTS):
+    total = tentativas if tentativas is not None else RATE_LIMIT_ATTEMPTS
+    for tentativa in range(total):
         try:
             df = getattr(ticker_obj, attr)
             if df is not None and not df.empty:
@@ -829,7 +833,7 @@ def _fetch_statement(ticker_obj, attr: str) -> pd.DataFrame | None:
                 raise
             erro_str = type(exc).__name__
 
-        if tentativa < RATE_LIMIT_ATTEMPTS - 1:
+        if tentativa < total - 1:
             espera = RATE_LIMIT_BACKOFF * (2 ** tentativa) + random.uniform(0, 2)
             log.debug("%s: %s, esperando %.1fs", attr, erro_str, espera)
             time.sleep(espera)
@@ -859,6 +863,10 @@ def _read_cache(ticker: str) -> dict | None:
     age_hours = (time.time() - os.path.getmtime(path)) / 3600
     if not payload:                                   # {} = falha registrada
         return None if age_hours > FAILURE_TTL_HOURS else {}
+
+    if payload.get("schema") != CACHE_SCHEMA:         # guardado por versao antiga
+        return None
+
     return None if age_hours > FUNDAMENTALS_TTL_DAYS * 24 else payload
 
 
@@ -990,8 +998,8 @@ def fetch_fundamentals(ticker: str, use_cache: bool = True) -> dict | None:
             step = span = 1
 
         # Fluxo de caixa: necessario para CAPEX/Receita e margem de FCF.
-        # Ausencia NAO elimina a empresa; so deixa essas duas metricas vazias.
-        cf = _fetch_statement(t, "cashflow")
+        # Opcional — poucas tentativas para nao gastar minutos com quem nao tem.
+        cf = _fetch_statement(t, "cashflow", tentativas=1)
 
         if inc is None:
             return _fail_nocache(ticker, "fundamento: DRE nao veio (provavel bloqueio)")
@@ -1057,7 +1065,18 @@ def fetch_fundamentals(ticker: str, use_cache: bool = True) -> dict | None:
         eps_ltm = _sum_window(eps_s, 0, span)
         op_margin = (ebit_ltm / rev_ltm) if rev_ltm and rev_ltm > 0 else None
 
-        extras = metricas_plurianuais(inc, bal, cf, tax_rate)
+        # Metricas de 3 anos SO fazem sentido sobre demonstrativo anual.
+        # Se o caminho trimestral foi usado, buscamos o anual so para elas.
+        if span == 1:
+            inc_anual, bal_anual = inc, bal
+        else:
+            inc_anual = _fetch_statement(t, "income_stmt", tentativas=1)
+            bal_anual = _fetch_statement(t, "balance_sheet", tentativas=1)
+
+        if inc_anual is not None and bal_anual is not None:
+            extras = metricas_plurianuais(inc_anual, bal_anual, cf, tax_rate)
+        else:
+            extras = {"anos_disponiveis": 0}
 
         total_debt = _at(_row(bal, ["Total Debt"]), 0) or 0.0
         cash = _at(_row(bal, ["Cash And Cash Equivalents",
@@ -1087,6 +1106,7 @@ def fetch_fundamentals(ticker: str, use_cache: bool = True) -> dict | None:
             "basis": "quarterly_ltm" if span == 4 else "annual",
         }
         payload.update(extras)
+        payload["schema"] = CACHE_SCHEMA
         _write_cache(ticker, payload)
         return payload
 
