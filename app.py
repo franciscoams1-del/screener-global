@@ -53,6 +53,9 @@ def nome_bolsa(sufixo: str) -> str:
 
 # @st.dialog existe a partir do Streamlit 1.35; antes era experimental_dialog.
 dialog = getattr(st, "dialog", None) or getattr(st, "experimental_dialog")
+# st.fragment recarrega SO o pedaco macro, sem redesenhar a lista de acoes.
+fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
+SEGUNDOS_MACRO = 60
 
 st.set_page_config(
     page_title="Screener Global | Minervini + ROIC",
@@ -160,9 +163,10 @@ MACRO = {
 }
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=55, show_spinner=False)
 def load_macro() -> list[dict]:
-    """16 ativos, uma unica chamada em lote, cache de 5 minutos."""
+    """16 ativos, uma unica chamada em lote. Cache curto: a barra macro
+    se atualiza sozinha a cada minuto pelo fragmento."""
     out: list[dict] = []
     try:
         raw = yf.download(
@@ -183,6 +187,7 @@ def load_macro() -> list[dict]:
                 "label": label,
                 "value": last,
                 "change_pct": (last / prev - 1) * 100 if prev else 0.0,
+                "hora": datetime.now().strftime("%H:%M:%S"),
             })
         except Exception:
             continue
@@ -238,7 +243,7 @@ def card_html(row: dict) -> str:
     css = "card-up" if up else "card-down"
     chg_css = "chg-up" if up else "chg-down"
     name = (row.get("name") or row["ticker"])[:34]
-    roic = fmt_pct(row.get("roic"), 1, already_pct=False)
+    roic = fmt_pct(row.get("roic_3y_avg") or row.get("roic"), 1, already_pct=False)
     roiic = fmt_pct(row.get("roiic"), 1, already_pct=False)
 
     def ma_cell(label, value):
@@ -312,25 +317,50 @@ def analysis_dialog(row: dict) -> None:
         fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
         st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("##### Fundamentos (LTM)")
+    st.markdown("##### Retorno sobre capital")
+    metrics = [
+        ("ROIC 3A médio", fmt_pct(row.get("roic_3y_avg"), 1, already_pct=False)),
+        ("ROIIC", fmt_pct(row.get("roiic"), 1, already_pct=False)),
+        ("ROCE 3A médio", fmt_pct(row.get("roce_3y_avg"), 1, already_pct=False)),
+        ("Capital Investido", fmt_big(row.get("invested_capital"))),
+    ]
+    for col, (label, value) in zip(st.columns(4), metrics):
+        col.metric(label, value)
+
+    st.markdown("##### Crescimento e margens")
+    metrics = [
+        ("Receita CAGR 3A", fmt_pct(row.get("revenue_cagr_3y"), 1, already_pct=False)),
+        ("EPS diluído CAGR 3A", fmt_pct(row.get("eps_cagr_3y"), 1, already_pct=False)),
+        ("Margem bruta 3A média", fmt_pct(row.get("gross_margin_3y_avg"), 1, already_pct=False)),
+        ("Margem FCF 3A média", fmt_pct(row.get("fcf_margin_3y_avg"), 1, already_pct=False)),
+        ("CAPEX / Receita LTM", fmt_pct(row.get("capex_to_revenue_ltm"), 1, already_pct=False)),
+        ("Lucro líquido 3A médio", fmt_big(row.get("net_income_3y_avg"))),
+        ("Receita LTM", fmt_big(row.get("revenue_ltm"))),
+        ("EBIT LTM", fmt_big(row.get("ebit_ltm"))),
+    ]
+    for i in range(0, len(metrics), 4):
+        for col, (label, value) in zip(st.columns(4), metrics[i:i + 4]):
+            col.metric(label, value)
+
+    st.markdown("##### Avaliação e estrutura de capital")
     metrics = [
         ("Enterprise Value", fmt_big(row.get("enterprise_value"))),
         ("Dívida Líquida", fmt_big(row.get("net_debt"))),
         ("Market Cap", fmt_big(row.get("market_cap"))),
-        ("EPS", fmt_num(row.get("eps_ltm"))),
+        ("EPS (LTM)", fmt_num(row.get("eps_ltm"))),
         ("P/E", fmt_num(row.get("pe_ratio"))),
-        ("Margem Operacional", fmt_pct(row.get("operating_margin"), 1, already_pct=False)),
-        ("ROIC", fmt_pct(row.get("roic"), 1, already_pct=False)),
-        ("ROIIC", fmt_pct(row.get("roiic"), 1, already_pct=False)),
-        ("Receita LTM", fmt_big(row.get("revenue_ltm"))),
-        ("EBIT LTM", fmt_big(row.get("ebit_ltm"))),
-        ("Capital Investido", fmt_big(row.get("invested_capital"))),
+        ("Margem operacional LTM", fmt_pct(row.get("operating_margin"), 1, already_pct=False)),
         ("Alíquota efetiva", fmt_pct(row.get("tax_rate"), 1, already_pct=False)),
+        ("Exercícios usados", str(row.get("anos_disponiveis") or "—")),
     ]
     for i in range(0, len(metrics), 4):
-        cols = st.columns(4)
-        for col, (label, value) in zip(cols, metrics[i:i + 4]):
+        for col, (label, value) in zip(st.columns(4), metrics[i:i + 4]):
             col.metric(label, value)
+    st.caption(
+        "Alíquota efetiva = imposto pago ÷ lucro antes dos impostos. Fora da faixa "
+        "de 20% a 34% costuma indicar crédito tributário ou benefício fiscal, e o "
+        "ROIC dessa empresa merece conferência."
+    )
 
     st.markdown("##### Força relativa e timing")
     f1, f2, f3, f4 = st.columns(4)
@@ -393,24 +423,33 @@ st.caption(
 )
 
 # --- Faixa macro (ao vivo) -------------------------------------------------
-with st.expander("Macro e commodities (ao vivo)", expanded=True):
+def desenhar_macro() -> None:
     macro = load_macro()
     if not macro:
         st.info("Não foi possível carregar os dados macro agora.")
-    else:
-        for i in range(0, len(macro), 8):
-            cols = st.columns(8)
-            for col, item in zip(cols, macro[i:i + 8]):
-                color = "#2ecc71" if item["change_pct"] >= 0 else "#e74c3c"
-                col.markdown(
-                    f"""<div class="macro-tile">
-                          <div class="macro-label">{item['label']}</div>
-                          <div class="macro-value">{fmt_num(item['value'])}</div>
-                          <div class="macro-chg" style="color:{color}">
-                            {fmt_pct(item['change_pct'])}</div>
-                        </div>""",
-                    unsafe_allow_html=True,
-                )
+        return
+    for i in range(0, len(macro), 8):
+        cols = st.columns(8)
+        for col, item in zip(cols, macro[i:i + 8]):
+            color = "#2ecc71" if item["change_pct"] >= 0 else "#e74c3c"
+            col.markdown(
+                f"""<div class="macro-tile">
+                      <div class="macro-label">{item['label']}</div>
+                      <div class="macro-value">{fmt_num(item['value'])}</div>
+                      <div class="macro-chg" style="color:{color}">
+                        {fmt_pct(item['change_pct'])}</div>
+                    </div>""",
+                unsafe_allow_html=True,
+            )
+    st.caption(f"Atualizado às {macro[0]['hora']} · renova sozinho a cada minuto")
+
+
+# O fragmento redesenha so esta faixa, sem recarregar a lista de acoes.
+if fragment is not None:
+    desenhar_macro = fragment(run_every=SEGUNDOS_MACRO)(desenhar_macro)
+
+with st.expander("Macro e commodities (ao vivo)", expanded=True):
+    desenhar_macro()
 
 # --- Sidebar: filtros ------------------------------------------------------
 with st.sidebar:
@@ -428,11 +467,33 @@ with st.sidebar:
                        for w in winners})
     chosen_markets = st.multiselect("Praça (sufixo Yahoo)", suffixes, default=[])
 
-    min_roic = st.slider("ROIC mínimo (%)", 15, 60, 15, step=1)
+    st.markdown("**Filtros fundamentalistas**")
+    incluir_sem_dado = st.checkbox(
+        "Manter ativos sem o dado", value=True,
+        help="Desmarque para exigir que a métrica exista. Cuidado: o Yahoo "
+             "deixa buracos em balanços fora dos EUA.",
+    )
+
+    FILTROS = [
+        ("roic_3y_avg",         "ROIC 3A médio ≥ (%)",        0,  60,  0,  "min"),
+        ("roce_3y_avg",         "ROCE 3A médio ≥ (%)",        0,  60,  0,  "min"),
+        ("revenue_cagr_3y",     "Receita CAGR 3A ≥ (%)",    -20,  50, -20, "min"),
+        ("eps_cagr_3y",         "EPS CAGR 3A ≥ (%)",        -20,  50, -20, "min"),
+        ("gross_margin_3y_avg", "Margem bruta 3A ≥ (%)",      0,  90,  0,  "min"),
+        ("fcf_margin_3y_avg",   "Margem FCF 3A ≥ (%)",      -20,  50, -20, "min"),
+        ("capex_to_revenue_ltm", "CAPEX/Receita LTM ≤ (%)",   0,  40,  40, "max"),
+    ]
+
+    cortes: dict[str, tuple[float, str]] = {}
+    for campo, rotulo, minimo, maximo, padrao, sentido in FILTROS:
+        escolhido = st.slider(rotulo, minimo, maximo, padrao, step=1)
+        cortes[campo] = (escolhido / 100, sentido)
+
+    lucro_min = st.slider("Lucro líquido 3A médio ≥ (milhões)", 0, 5000, 0, step=50)
     order = st.selectbox(
         "Ordenar por",
-        ["Força relativa", "ROIC", "ROIIC", "Variação %",
-         "Distância da MM200", "IFR (14)", "Ticker"],
+        ["Força relativa", "ROIC 3A", "ROIIC", "ROCE 3A", "Receita CAGR 3A",
+         "Margem FCF 3A", "Variação %", "Distância da MM200", "IFR (14)", "Ticker"],
     )
     agrupar = st.toggle("Agrupar por bolsa", value=True)
 
@@ -445,12 +506,35 @@ if chosen_sectors:
 if chosen_markets:
     rows = [r for r in rows
             if (r["ticker"].split(".")[-1] if "." in r["ticker"] else "US") in chosen_markets]
-rows = [r for r in rows if (r.get("roic") or 0) * 100 >= min_roic]
+
+
+def passa_filtros(r: dict) -> bool:
+    for campo, (corte, sentido) in cortes.items():
+        valor = r.get(campo)
+        if valor is None:
+            if not incluir_sem_dado:
+                return False
+            continue
+        if sentido == "min" and valor < corte:
+            return False
+        if sentido == "max" and valor > corte:
+            return False
+
+    lucro = r.get("net_income_3y_avg")
+    if lucro is None:
+        return incluir_sem_dado
+    return lucro >= lucro_min * 1_000_000
+
+
+rows = [r for r in rows if passa_filtros(r)]
 
 sort_key = {
     "Força relativa": lambda r: r.get("rs_rating") or 0,
     "IFR (14)": lambda r: r.get("rsi_14") or 0,
-    "ROIC": lambda r: r.get("roic") or 0,
+    "ROIC 3A": lambda r: r.get("roic_3y_avg") or 0,
+    "ROCE 3A": lambda r: r.get("roce_3y_avg") or 0,
+    "Receita CAGR 3A": lambda r: r.get("revenue_cagr_3y") or -9,
+    "Margem FCF 3A": lambda r: r.get("fcf_margin_3y_avg") or -9,
     "ROIIC": lambda r: r.get("roiic") or 0,
     "Variação %": lambda r: r.get("change_pct") or 0,
     "Distância da MM200": lambda r: r.get("dist_ma200_pct") or 0,
@@ -515,7 +599,9 @@ with st.expander("Ver dados em tabela"):
     show_cols = ["rank_rs", "ticker", "name", "exchange", "sector", "price",
                  "change_pct", "rs_rating", "rsi_14",
                  "dist_ma50_pct", "dist_ma150_pct", "dist_ma200_pct",
-                 "roic", "roiic", "pe_ratio", "operating_margin", "eps_ltm"]
+                 "roic_3y_avg", "roiic", "roce_3y_avg", "revenue_cagr_3y",
+                 "eps_cagr_3y", "gross_margin_3y_avg", "fcf_margin_3y_avg",
+                 "capex_to_revenue_ltm", "net_income_3y_avg", "pe_ratio", "eps_ltm"]
     table = pd.DataFrame(rows)
     table = table[[c for c in show_cols if c in table.columns]]
     st.dataframe(table, use_container_width=True, hide_index=True)
